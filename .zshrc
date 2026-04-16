@@ -18,10 +18,26 @@ setopt AUTO_CD                # type a dir name to cd into it
 setopt CORRECT                # suggest corrections for mistyped commands
 setopt INTERACTIVE_COMMENTS   # allow # comments in interactive shell
 
+# ##### Key bindings triggers #####
+_CLOCK_PAUSED=0
+
+_toggle_clock() {
+    # Active clock disables the prompt highlighting which makes copying impossible
+    # This method disable/enables the clock.
+    if [[ $_CLOCK_PAUSED -eq 0 ]]; then
+        _CLOCK_PAUSED=1
+    else
+        _CLOCK_PAUSED=0
+    fi
+}
+zle -N _toggle_clock
+
 # ##### Key bindings #####
 bindkey -e                    # emacs-style (use -v for vi)
 bindkey "^[[1;5C" forward-word   # Ctrl + Right
 bindkey "^[[1;5D" backward-word  # Ctrl + Left
+bindkey '^P' _toggle_clock      # Ctrl + P 
+
 
 # ##### Colors & aliases #####
 autoload -U colors && colors
@@ -43,9 +59,9 @@ precmd() {
     _PROMPT_SINCE="$(date '+%Y-%m-%d %H:%M:%S')"
 }
 
-TMOUT=1
+TMOUT=1 
 TRAPALRM() {
-    zle && zle reset-prompt
+    [[ $_CLOCK_PAUSED -eq 0 ]] && zle && zle reset-prompt
 }
 
 clean_branch() {
