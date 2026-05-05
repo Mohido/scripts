@@ -1,0 +1,725 @@
+#!/usr/bin/env python3
+"""svmm — simple/small virtual machine manager.
+
+Five commands: create, destroy, mount, unmount, ssh.
+Everything else (list/status/start/stop/console/...) is just virsh.
+
+Per-VM directory layout under --base-dir (default ~/.local/share/svmm):
+    images/                 cached base cloud images, keyed by basename
+    <name>/
+        disk.qcow2          per-VM overlay disk
+        user-data           rendered cloud-init user-data
+        meta-data           rendered cloud-init meta-data
+        id_ed25519[.pub]    per-VM SSH key
+
+Source of truth for runtime config (mounts, ram, etc.) is the libvirt
+domain XML. svmm reads/edits it via virsh.
+
+Requires: virt-install, virsh, qemu-img, ssh-keygen, virtiofsd, PyYAML.
+
+
+Pre-requesites:
+# Create svmm's base directory under libvirt's allowed path
+sudo mkdir -p /var/lib/libvirt/images/svmm
+
+# Group-own it as libvirt-qemu so the qemu user can read children
+sudo chgrp libvirt-qemu /var/lib/libvirt/images/svmm
+
+# 2775 = setgid + rwx for owner & group, rx for others.
+# The setgid bit makes new files/dirs inherit the libvirt-qemu group,
+# so disks svmm creates are automatically readable by qemu.
+sudo chmod 2775 /var/lib/libvirt/images/svmm
+
+# Add yourself to the group so YOU can write into the directory
+sudo usermod -aG libvirt-qemu $USER
+
+
+# make sure that group and others have read access to /var/lib/libvirt/images
+sudo chmod o+r /var/lib/libvirt/images
+
+# Don't worry about the ssh keys, they are not readable except by your user
+-rw-r--r-- 1 libvirt-qemu kvm          70713344 May  6 01:38 disk.qcow2
+-rw------- 1 mohido       libvirt-qemu      411 May  6 01:31 id_ed25519
+-rw-r--r-- 1 mohido       libvirt-qemu      102 May  6 01:31 id_ed25519.pub
+-rw-rw-r-- 1 mohido       libvirt-qemu       61 May  6 01:31 meta-data
+-rw-rw-r-- 1 mohido       libvirt-qemu      391 May  6 01:31 user-data
+"""
+
+from __future__ import annotations
+
+import argparse
+import os
+import re
+import shlex
+import shutil
+import subprocess
+import sys
+import tempfile
+import urllib.parse
+import urllib.request
+import xml.etree.ElementTree as ET
+from pathlib import Path
+from typing import Optional
+
+try:
+    import yaml  # type: ignore
+except ImportError:
+    sys.stderr.write("error: PyYAML required (apt install python3-yaml)\n")
+    sys.exit(2)
+
+
+DEFAULT_BASE_DIR = Path("/var/lib/libvirt/images/svmm")
+LIBVIRT_URI = "qemu:///system"
+
+
+# ---------------------------------------------------------------------------
+# helpers
+# ---------------------------------------------------------------------------
+
+def run(cmd: list[str], *, check: bool = True, capture: bool = False) -> subprocess.CompletedProcess:
+    return subprocess.run(cmd, check=check, capture_output=capture, text=capture)
+
+
+def virsh(*args: str, check: bool = True, capture: bool = False) -> subprocess.CompletedProcess:
+    return run(["virsh", "--connect", LIBVIRT_URI, *args], check=check, capture=capture)
+
+
+def domain_exists(name: str) -> bool:
+    return virsh("dominfo", name, check=False, capture=True).returncode == 0
+
+
+def domain_running(name: str) -> bool:
+    cp = virsh("domstate", name, check=False, capture=True)
+    return cp.returncode == 0 and cp.stdout.strip() == "running"
+
+
+def mount_tag(dst: str) -> str:
+    """Stable virtiofs tag derived from the guest mount point."""
+    stem = dst.lstrip("/").replace("/", "_")
+    return f"svmm_{stem}" if stem else "svmm_root"
+
+
+def parse_mount(spec: str) -> tuple[str, str]:
+    if ":" not in spec:
+        sys.exit(f"invalid mount {spec!r} (expected src:dst)")
+    src, dst = spec.split(":", 1)
+    src_p = Path(src).expanduser().resolve()
+    if not src_p.is_dir():
+        sys.exit(f"mount source must be an existing directory: {src_p}")
+    if not dst.startswith("/"):
+        sys.exit(f"mount dst must be an absolute guest path: {dst}")
+    return str(src_p), dst
+
+
+def first_ipv4(text: str) -> Optional[str]:
+    for line in text.splitlines():
+        for token in line.split():
+            if token.count(".") == 3 and "/" in token:
+                ip = token.split("/", 1)[0]
+                octs = ip.split(".")
+                if len(octs) == 4 and all(o.isdigit() and 0 <= int(o) <= 255 for o in octs):
+                    return ip
+    return None
+
+
+def write_temp_xml(content: str) -> str:
+    with tempfile.NamedTemporaryFile("w", suffix=".xml", delete=False) as f:
+        f.write(content)
+        return f.name
+
+
+# ---------------------------------------------------------------------------
+# image cache
+# ---------------------------------------------------------------------------
+
+def image_basename(source: str) -> str:
+    if "://" in source:
+        return urllib.parse.urlparse(source).path.rsplit("/", 1)[-1] or "image"
+    return source.rsplit("/", 1)[-1]
+
+
+def fetch_image(source: str, cache_dir: Path) -> Path:
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    name = image_basename(source)
+    if not name:
+        sys.exit(f"could not derive image name from {source!r}")
+    dest = cache_dir / name
+    if dest.exists():
+        print(f"image at {dest} exists, skip downloading...")
+        return dest
+    if "://" in source:
+        print(f"downloading {source} -> {dest}")
+        tmp = dest.with_suffix(dest.suffix + ".part")
+        try:
+            with urllib.request.urlopen(source) as r, tmp.open("wb") as f:
+                shutil.copyfileobj(r, f)
+            tmp.rename(dest)
+        finally:
+            if tmp.exists():
+                tmp.unlink()
+    else:
+        src = Path(source).expanduser().resolve()
+        if not src.is_file():
+            sys.exit(f"image not found: {src}")
+        print(f"copying {src} -> {dest}")
+        shutil.copy2(src, dest)
+    return dest
+
+
+# ---------------------------------------------------------------------------
+# cloud-init
+# ---------------------------------------------------------------------------
+
+def default_user() -> dict:
+    return {
+        "name": "dev",
+        "groups": ["sudo"],
+        "shell": "/bin/bash",
+        "sudo": "ALL=(ALL) NOPASSWD:ALL",
+        "ssh_authorized_keys": [],
+    }
+
+
+def ensure_ssh_key(key_path: Path) -> str:
+    pub = key_path.with_suffix(".pub")
+    if not key_path.exists():
+        run(["ssh-keygen", "-t", "ed25519", "-N", "", "-q",
+             "-f", str(key_path), "-C", f"svmm:{key_path.parent.name}"])
+    return pub.read_text().strip()
+
+
+def inject_key(doc: dict, pubkey: str) -> dict:
+    """Insert pubkey into users[0].ssh_authorized_keys, creating structure as needed."""
+    users = doc.get("users")
+    if not isinstance(users, list) or not users:
+        u = default_user()
+        u["ssh_authorized_keys"] = [pubkey]
+        doc["users"] = [u]
+        return doc
+    first = users[0]
+    if not isinstance(first, dict):
+        # e.g. ['default', {...}] — prepend our user
+        u = default_user()
+        u["ssh_authorized_keys"] = [pubkey]
+        users.insert(0, u)
+        return doc
+    keys = first.setdefault("ssh_authorized_keys", [])
+    if pubkey not in keys:
+        keys.append(pubkey)
+    return doc
+
+
+def render_cloud_init(
+    vm_dir: Path, name: str, template: Optional[Path],
+    mounts: list[tuple[str, str]], no_default_key: bool,
+) -> tuple[Path, Path]:
+    if template is not None:
+        if not template.is_file():
+            sys.exit(f"cloud-init template not found: {template}")
+        try:
+            doc = yaml.safe_load(template.read_text()) or {}
+        except yaml.YAMLError as e:
+            sys.exit(f"failed to parse cloud-init template {template}: {e}")
+        if not isinstance(doc, dict):
+            sys.exit(f"cloud-init template must be a YAML mapping at the top level")
+    else:
+        doc = {"users": [default_user()]}
+
+    if not no_default_key:
+        pubkey = ensure_ssh_key(vm_dir / "id_ed25519")
+        inject_key(doc, pubkey)
+
+    if mounts:
+        fstab = doc.setdefault("mounts", [])
+        runcmd = doc.setdefault("runcmd", [])
+        for src, dst in mounts:
+            fstab.append([mount_tag(dst), dst, "virtiofs", "defaults,_netdev", "0", "0"])
+            runcmd.append(f"mkdir -p {dst}")
+        runcmd.append("mount -a || true")
+
+    user_data = vm_dir / "user-data"
+    meta_data = vm_dir / "meta-data"
+    user_data.write_text("#cloud-config\n" + yaml.safe_dump(doc, sort_keys=False))
+    meta_data.write_text(f"instance-id: {name}\nlocal-hostname: {name}\n")
+    return user_data, meta_data
+
+
+# ---------------------------------------------------------------------------
+# libvirt XML manipulation (state lives here)
+# ---------------------------------------------------------------------------
+
+def domain_xml(name: str) -> ET.Element:
+    cp = virsh("dumpxml", name, capture=True)
+    return ET.fromstring(cp.stdout)
+
+
+def define_domain(root: ET.Element) -> None:
+    path = write_temp_xml(ET.tostring(root, encoding="unicode"))
+    try:
+        virsh("define", path, capture=True)
+    finally:
+        os.unlink(path)
+
+
+def filesystem_element(src: str, tag: str) -> ET.Element:
+    fs = ET.Element("filesystem", {"type": "mount", "accessmode": "passthrough"})
+    ET.SubElement(fs, "driver", {"type": "virtiofs"})
+    ET.SubElement(fs, "source", {"dir": src})
+    ET.SubElement(fs, "target", {"dir": tag})
+    return fs
+
+
+def existing_filesystem_targets(root: ET.Element) -> dict[str, ET.Element]:
+    """Map virtiofs target tag -> <filesystem> element."""
+    out: dict[str, ET.Element] = {}
+    for fs in root.findall("./devices/filesystem"):
+        driver = fs.find("driver")
+        target = fs.find("target")
+        if driver is not None and driver.get("type") == "virtiofs" and target is not None:
+            tag = target.get("dir")
+            if tag:
+                out[tag] = fs
+    return out
+
+
+def ensure_shared_memory(root: ET.Element) -> bool:
+    """Add <memoryBacking><source type='memfd'/><access mode='shared'/></memoryBacking>
+    if missing. virtiofs requires this. Returns True if XML was modified."""
+    mb = root.find("memoryBacking")
+    if mb is None:
+        mb = ET.SubElement(root, "memoryBacking")
+    changed = False
+    if mb.find("source") is None:
+        ET.SubElement(mb, "source", {"type": "memfd"})
+        changed = True
+    if mb.find("access") is None:
+        ET.SubElement(mb, "access", {"mode": "shared"})
+        changed = True
+    return changed
+
+
+def hot_attach(name: str, src: str, dst: str) -> bool:
+    tag = mount_tag(dst)
+    xml = ET.tostring(filesystem_element(src, tag), encoding="unicode")
+    path = write_temp_xml(xml)
+    try:
+        cp = virsh("attach-device", name, path, "--live", check=False, capture=True)
+    finally:
+        os.unlink(path)
+    if cp.returncode != 0:
+        print(f"warning: hot-attach failed for {src} -> {dst}: {cp.stderr.strip()}")
+        return False
+    print(f"hot-attached {src} -> {dst} (tag {tag})")
+    print(f"        in guest: sudo mount -t virtiofs {tag} {dst}")
+    return True
+
+
+def hot_detach(name: str, src: str, tag: str) -> bool:
+    xml = ET.tostring(filesystem_element(src, tag), encoding="unicode")
+    path = write_temp_xml(xml)
+    try:
+        cp = virsh("detach-device", name, path, "--live", check=False, capture=True)
+    finally:
+        os.unlink(path)
+    if cp.returncode != 0:
+        print(f"warning: hot-detach failed for tag {tag}: {cp.stderr.strip()}")
+        return False
+    print(f"hot-detached tag {tag}")
+    return True
+
+
+# ---------------------------------------------------------------------------
+# commands
+# ---------------------------------------------------------------------------
+
+def cmd_create(args: argparse.Namespace) -> None:
+    base = args.base_dir
+    images_dir = base / "images"
+    vm_dir = base / args.name
+    base.mkdir(parents=True, exist_ok=True)
+
+    if domain_exists(args.name):
+        sys.exit(f"domain {args.name!r} already exists")
+    if vm_dir.exists():
+        sys.exit(f"vm dir already exists: {vm_dir}")
+
+    image = fetch_image(args.image, images_dir)
+    vm_dir.mkdir(parents=True)
+
+    disk = vm_dir / "disk.qcow2"
+    run([
+        "qemu-img", "create", "-f", "qcow2",
+        "-F", "qcow2", "-b", str(image),
+        str(disk), f"{args.disk}G",
+    ])
+    mounts = [parse_mount(m) for m in (args.mount or [])]
+    user_data, meta_data = render_cloud_init(
+        vm_dir, args.name,
+        Path(args.cloud_init) if args.cloud_init else None,
+        mounts, args.no_default_key,
+    )
+
+    cmd = [
+        "virt-install",
+        "--connect", LIBVIRT_URI,
+        "--name", args.name,
+        "--memory", str(args.ram),
+        "--vcpus", str(args.vcpus),
+        "--cpu", "host-passthrough",
+        "--os-variant", args.os_variant,
+        "--disk", f"path={disk},format=qcow2,bus=virtio",
+        "--network", "network=default,model=virtio",
+        "--graphics", "none",
+        "--noautoconsole",
+        "--import",
+        "--cloud-init", f"user-data={user_data},meta-data={meta_data}",
+    ]
+    if mounts:
+        cmd += ["--memorybacking", "source.type=memfd,access.mode=shared"]
+        for src, dst in mounts:
+            cmd += ["--filesystem", f"{src},{mount_tag(dst)},driver.type=virtiofs"]
+
+    run(cmd)
+    print(f"VM {args.name!r} starting; cloud-init runs on first boot")
+    print(f"  ssh key: {vm_dir / 'id_ed25519'}")
+
+
+def cmd_destroy(args: argparse.Namespace) -> None:
+    if domain_exists(args.name):
+        if not args.yes:
+            ans = input(f"Permanently delete VM {args.name!r}? [y/N] ")
+            if ans.strip().lower() not in ("y", "yes"):
+                print("aborted")
+                return
+        virsh("destroy", args.name, check=False, capture=True)
+        virsh("undefine", args.name, "--remove-all-storage", check=False, capture=True)
+    vm_dir = args.base_dir / args.name
+    if vm_dir.exists():
+        shutil.rmtree(vm_dir)
+    print(f"removed {args.name}")
+
+
+def cmd_mount(args: argparse.Namespace) -> None:
+    if not domain_exists(args.name):
+        sys.exit(f"no such VM: {args.name}")
+    new_mounts = [parse_mount(m) for m in args.mount]
+
+    root = domain_xml(args.name)
+    devices = root.find("devices")
+    if devices is None:
+        devices = ET.SubElement(root, "devices")
+    existing = existing_filesystem_targets(root)
+
+    xml_changed = ensure_shared_memory(root)
+    added: list[tuple[str, str]] = []
+    for src, dst in new_mounts:
+        tag = mount_tag(dst)
+        if tag in existing:
+            if existing[tag].find("source").get("dir") == src:
+                print(f"already in domain XML: {src} -> {dst} (tag {tag})")
+                continue
+            devices.remove(existing[tag])
+        devices.append(filesystem_element(src, tag))
+        added.append((src, dst))
+        xml_changed = True
+
+    if xml_changed:
+        define_domain(root)
+    print(f"persisted {len(added)} mount(s) to domain XML")
+
+    if not added:
+        return
+
+    # Live-attach + in-guest mount + fstab. All require the VM to be running.
+    if not domain_running(args.name):
+        if args.hot or not args.no_fstab or not args.no_mount:
+            print(f"warning: {args.name} is not running; "
+                  "skipped hot-attach / fstab / live mount.")
+            print("        re-run 'svmm mount' (or boot the VM) to apply them.")
+        return
+
+    if args.hot:
+        for src, dst in added:
+            hot_attach(args.name, src, dst)
+
+    target = ssh_target(args.name, args.base_dir)
+    if target is None:
+        print("warning: could not SSH into guest (no IP yet, or no svmm key); "
+              "skipped fstab / live mount.")
+        return
+
+    if not args.no_mount:
+        for src, dst in added:
+            if guest_mount(target, mount_tag(dst), dst):
+                print(f"mounted in guest: {dst}")
+
+    if not args.no_fstab:
+        if fstab_apply(target, add=added, remove_tags=set()):
+            print(f"updated /etc/fstab in guest ({len(added)} entries)")
+
+
+def cmd_unmount(args: argparse.Namespace) -> None:
+    if not domain_exists(args.name):
+        sys.exit(f"no such VM: {args.name}")
+    targets_dst = []
+    for spec in args.mount:
+        if not spec.startswith("/"):
+            sys.exit(f"unmount target must be an absolute guest path, got {spec!r} "
+                     "(svmm unmount takes dst paths, not src:dst)")
+        targets_dst.append(spec)
+    targets_tag = {mount_tag(d) for d in targets_dst}
+
+    root = domain_xml(args.name)
+    devices = root.find("devices")
+    existing = existing_filesystem_targets(root)
+
+    removed: list[tuple[str, str, str]] = []  # (src, dst, tag)
+    for tag, fs in existing.items():
+        if tag in targets_tag:
+            src = fs.find("source").get("dir") or ""
+            # We don't store dst in the XML target; recover it from the
+            # original argv since the user just told us.
+            # Find the matching dst from args.mount.
+            dst = next((d for d in targets_dst if mount_tag(d) == tag), tag)
+            devices.remove(fs)
+            removed.append((src, dst, tag))
+
+    if not removed:
+        print("nothing to unmount (no matching dst)")
+        return
+
+    define_domain(root)
+    print(f"removed {len(removed)} mount(s) from domain XML")
+
+    if not domain_running(args.name):
+        if args.hot or not args.no_fstab or not args.no_mount:
+            print(f"warning: {args.name} is not running; "
+                  "skipped fstab cleanup / live umount / hot-detach.")
+        return
+
+    target = ssh_target(args.name, args.base_dir)
+
+    # Order matters:
+    #   1. fstab first, so a concurrent `mount -a` doesn't re-mount.
+    #   2. umount the path so it's no longer in use.
+    #   3. detach the device from the running domain.
+    if target is not None:
+        if not args.no_fstab:
+            if fstab_apply(target, add=[], remove_tags=targets_tag):
+                print(f"cleaned /etc/fstab in guest ({len(removed)} entries)")
+        if not args.no_mount:
+            for _, dst, _ in removed:
+                if guest_umount(target, dst):
+                    print(f"unmounted in guest: {dst}")
+    elif not args.no_fstab or not args.no_mount:
+        print("warning: could not SSH into guest; skipped fstab / live umount.")
+
+    if args.hot:
+        for src, _, tag in removed:
+            hot_detach(args.name, src, tag)
+
+
+def cmd_ssh(args: argparse.Namespace) -> None:
+    target = ssh_target(args.name, args.base_dir, user=args.user)
+    if target is None:
+        if not domain_running(args.name):
+            sys.exit(f"{args.name} is not running")
+        if not (args.base_dir / args.name / "id_ed25519").exists():
+            sys.exit(f"no svmm-managed ssh key for {args.name}")
+        sys.exit("could not determine VM IP (cloud-init may still be running)")
+    key, user, ip = target
+    argv = ssh_argv(key, user, ip) + list(args.command)
+    os.execvp(argv[0], argv)
+
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
+
+# ---------------------------------------------------------------------------
+# guest SSH (used by `ssh` command and by mount/unmount fstab management)
+# ---------------------------------------------------------------------------
+
+def ssh_target(name: str, base_dir: Path, user: str = "dev") -> Optional[tuple[Path, str, str]]:
+    """Return (key_path, user, ip) for SSH-ing into a running VM, or None
+    if the VM isn't running, has no IP yet, or has no svmm-managed key."""
+    if not domain_running(name):
+        return None
+    cp = virsh("domifaddr", name, capture=True, check=False)
+    if cp.returncode != 0:
+        return None
+    ip = first_ipv4(cp.stdout)
+    if not ip:
+        return None
+    key = base_dir / name / "id_ed25519"
+    if not key.exists():
+        return None
+    return key, user, ip
+
+
+def ssh_argv(key: Path, user: str, ip: str, *, extra_opts: list[str] = ()) -> list[str]:
+    return [
+        "ssh",
+        "-i", str(key),
+        "-o", "StrictHostKeyChecking=no",
+        "-o", "UserKnownHostsFile=/dev/null",
+        "-o", "LogLevel=ERROR",
+        "-o", "ConnectTimeout=5",
+        *extra_opts,
+        f"{user}@{ip}",
+    ]
+
+
+def guest_run(target: tuple[Path, str, str], remote_cmd: str) -> subprocess.CompletedProcess:
+    """Run a shell command on the guest. Returns the CompletedProcess."""
+    key, user, ip = target
+    argv = ssh_argv(key, user, ip) + ["bash", "-s"]
+    return subprocess.run(argv, input=remote_cmd, capture_output=True, text=True, check=False)
+
+
+# ---------------------------------------------------------------------------
+# guest fstab + live mount management
+# ---------------------------------------------------------------------------
+
+# Marker so svmm can find/replace/remove its own fstab lines without
+# touching anything the user added by hand.
+FSTAB_MARK = "# svmm:"
+
+
+def fstab_apply(target: tuple[Path, str, str],
+                add: list[tuple[str, str]],
+                remove_tags: set[str]) -> bool:
+    """Update /etc/fstab on the guest: remove any svmm-marked lines whose
+    tag is in `remove_tags` or appears in `add` (re-adds), then append a
+    fresh marked line for each entry in `add`. Returns True on success."""
+    add_tags = {mount_tag(dst) for _, dst in add}
+    drop_tags = remove_tags | add_tags
+
+    new_lines = []
+    for tag, dst in [(mount_tag(dst), dst) for _, dst in add]:
+        new_lines.append(
+            f"{tag} {dst} virtiofs defaults,_netdev,nofail 0 0  {FSTAB_MARK}{tag}"
+        )
+
+    # Build a small bash program that filters fstab and appends our lines.
+    drop_pattern = "|".join(re.escape(f"{FSTAB_MARK}{t}") for t in drop_tags) or "__never_match__"
+    appended = "\n".join(new_lines)
+    script = f"""set -euo pipefail
+tmp=$(mktemp)
+sudo grep -Ev '({drop_pattern})$' /etc/fstab > "$tmp" || true
+{f'printf "%s\\n" {shlex.quote(appended)} >> "$tmp"' if appended else ""}
+sudo install -m 0644 "$tmp" /etc/fstab
+rm -f "$tmp"
+"""
+    cp = guest_run(target, script)
+    if cp.returncode != 0:
+        print(f"warning: fstab update failed: {cp.stderr.strip()}")
+        return False
+    return True
+
+
+def guest_mount(target: tuple[Path, str, str], tag: str, dst: str) -> bool:
+    """Run `sudo mount -t virtiofs <tag> <dst>` on the guest."""
+    cmd = f"sudo mkdir -p {shlex.quote(dst)} && sudo mount -t virtiofs {shlex.quote(tag)} {shlex.quote(dst)}"
+    cp = guest_run(target, cmd)
+    if cp.returncode != 0:
+        # Already mounted is fine
+        if "already mounted" in (cp.stderr or "").lower():
+            return True
+        print(f"warning: guest mount of {dst} failed: {cp.stderr.strip()}")
+        return False
+    return True
+
+
+def guest_umount(target: tuple[Path, str, str], dst: str) -> bool:
+    """Run `sudo umount <dst>` on the guest, ignoring 'not mounted' errors."""
+    cp = guest_run(target, f"sudo umount {shlex.quote(dst)}")
+    if cp.returncode != 0:
+        msg = (cp.stderr or "").lower()
+        if "not mounted" in msg or "not found" in msg:
+            return True
+        print(f"warning: guest umount of {dst} failed: {cp.stderr.strip()}")
+        return False
+    return True
+
+
+# ---------------------------------------------------------------------------
+# top-level `ssh` command
+# ---------------------------------------------------------------------------
+
+def build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(prog="svmm", description="simple/small virtual machine manager")
+    p.add_argument("--base-dir", type=Path, default=DEFAULT_BASE_DIR,
+                   help=f"svmm state directory (default: {DEFAULT_BASE_DIR})")
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    c = sub.add_parser("create", help="create and start a VM")
+    c.add_argument("-n", "--name", required=True)
+    c.add_argument("--image", required=True, help="URL or local path to a cloud image")
+    c.add_argument("--ram", type=int, default=2048, help="RAM in MiB (default 2048)")
+    c.add_argument("--vcpus", type=int, default=2, help="vCPUs (default 2)")
+    c.add_argument("--disk", type=int, default=20, help="disk size in GiB (default 20)")
+    c.add_argument("--os-variant", default="linux2024",
+                   help="virt-install --os-variant (default linux2024)")
+    c.add_argument("-m", "--mount", action="append", default=[],
+                   help="virtiofs share src:dst (repeatable)")
+    c.add_argument("--cloud-init", help="path to a cloud-init user-data YAML template")
+    c.add_argument("--no-default-key", action="store_true",
+                   help="do not inject svmm's generated SSH key")
+    c.set_defaults(func=cmd_create)
+
+    d = sub.add_parser("destroy", help="permanently remove a VM and its disk")
+    d.add_argument("-n", "--name", required=True)
+    d.add_argument("-y", "--yes", action="store_true")
+    d.set_defaults(func=cmd_destroy)
+
+    mt = sub.add_parser("mount", help="add virtiofs share(s) to a VM")
+    mt.add_argument("-n", "--name", required=True)
+    mt.add_argument("-m", "--mount", action="append", required=True,
+                    help="src:dst (repeatable)")
+    mt.add_argument("-H", "--hot", action="store_true",
+                    help="also try to hot-attach to a running VM")
+    mt.add_argument("--no-fstab", action="store_true",
+                    help="don't add an /etc/fstab entry inside the guest")
+    mt.add_argument("--no-mount", action="store_true",
+                    help="don't run `mount` inside the guest")
+    mt.set_defaults(func=cmd_mount)
+
+    um = sub.add_parser("unmount", help="remove virtiofs share(s) from a VM")
+    um.add_argument("-n", "--name", required=True)
+    um.add_argument("-m", "--mount", action="append", required=True,
+                    help="dst path of the mount to remove (repeatable)")
+    um.add_argument("-H", "--hot", action="store_true",
+                    help="also try to hot-detach from a running VM")
+    um.add_argument("--no-fstab", action="store_true",
+                    help="don't remove the /etc/fstab entry inside the guest")
+    um.add_argument("--no-mount", action="store_true",
+                    help="don't run `umount` inside the guest")
+    um.set_defaults(func=cmd_unmount)
+
+    s = sub.add_parser("ssh", help="ssh into a running VM")
+    s.add_argument("-n", "--name", required=True)
+    s.add_argument("-u", "--user", default="dev")
+    s.add_argument("command", nargs=argparse.REMAINDER,
+                   help="optional command to run via ssh")
+    s.set_defaults(func=cmd_ssh)
+
+    return p
+
+
+def main(argv: Optional[list[str]] = None) -> int:
+    args = build_parser().parse_args(argv)
+    args.base_dir = Path(args.base_dir).expanduser().resolve()
+    try:
+        args.func(args)
+        return 0
+    except subprocess.CalledProcessError as e:
+        print(f"error: command failed: {' '.join(e.cmd)}", file=sys.stderr)
+        return e.returncode or 1
+    except KeyboardInterrupt:
+        return 130
+
+
+if __name__ == "__main__":
+    sys.exit(main())
